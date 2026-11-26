@@ -36,7 +36,7 @@ def hyperlink(p, text, url):
     rel=p.part.relate_to(url,'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink',is_external=True)
     h=OxmlElement('w:hyperlink');h.set(qn('r:id'),rel)
     run=OxmlElement('w:r');pr=OxmlElement('w:rPr');color=OxmlElement('w:color');color.set(qn('w:val'),'0563C1');pr.append(color);run.append(pr)
-    tx=OxmlElement('w:t');tx.text=text;run.append(tx);h.append(run);p._p.append(h)
+    tx=OxmlElement('w:t');tx.text=re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]", "", text);run.append(tx);h.append(run);p._p.append(h)
 
 def set_top_bottom_wrap(inline):
     """Create a schema-ordered floating drawing preserving image relationship IDs."""
@@ -132,10 +132,10 @@ def is_legacy_header(text, bbox, page_height):
 
 def likely_continuation(text, bbox, previous_bbox, previous_style):
     """Spatial heuristic; never joins or rewrites source content."""
-    if previous_bbox is None or previous_style is None or explicit_level(text) is not None:
+    if previous_bbox is None or previous_style not in STYLE_NAMES[2:] or explicit_level(text) is not None:
         return False
     gap=bbox[1]-previous_bbox[3]
-    return -3 <= gap <= 18 and abs(bbox[0]-previous_bbox[0]) <= 45
+    return -3 <= gap <= 14 and abs(bbox[0]-previous_bbox[0]) <= 24
 
 def add_candidate_rule(db_path,trigger,action,value,evidence):
     c=db_connect(db_path); encoded=json.dumps(value)
@@ -189,6 +189,8 @@ def generate(pdf_path,template,start,end,out_dir,db_path=None,memory_enabled=Tru
         page=pdf[page_data['page']-1]
         previous_style=None
         previous_bbox=None
+        previous_paragraph=None
+        previous_text=None
         for bi,b in enumerate(page_data['blocks']):
             if b['kind']=='text':
                 if learned_header and is_legacy_header(b['text'],b['bbox'],page.rect.height):
@@ -196,6 +198,7 @@ def generate(pdf_path,template,start,end,out_dir,db_path=None,memory_enabled=Tru
                         if r['action']=='remove_legacy_header' and r['value'] is True:
                             rule_events.append({'rule_id':r['id'],'action':r['action'],'target':f"page:{page_data['page']}/block:{bi}",'status':'applied'})
                     trace.append({'page':page_data['page'],'index':bi,'kind':'filtered_legacy_header','source_text':b['text']})
+                    previous_paragraph=None;previous_bbox=None;previous_style=None;previous_text=None
                     continue
                 style=choose_style(b['text'])
                 if learned_continuation_v2 and likely_continuation(b['text'],b['bbox'],previous_bbox,previous_style):
@@ -210,19 +213,24 @@ def generate(pdf_path,template,start,end,out_dir,db_path=None,memory_enabled=Tru
                         style=previous_style
                         for r in memory:
                             if r['action']=='inherit_continuation_style' and r['value'] is True:rule_events.append({'rule_id':r['id'],'action':r['action'],'target':f"page:{page_data['page']}/block:{bi}",'status':'applied'})
-                p=d.add_paragraph(style=style if style in styles else 'Normal')
+                merge = bool(learned_continuation_v2 and previous_paragraph is not None and previous_text and likely_continuation(b['text'],b['bbox'],previous_bbox,previous_style) and not re.search(r'[。！？.!?；;：:]\s*$',previous_text) and style==previous_style)
+                p=previous_paragraph if merge else d.add_paragraph(style=style if style in styles else 'Normal')
                 display_text=b['text']
                 # Word template supplies automatic list numbers; remove only a matching visible prefix.
                 # Source text remains untouched in source_map.json.
                 patterns={STYLE_NAMES[2]:r'^\d+[.、]\s*',STYLE_NAMES[3]:r'^\(\d+\)\s*',STYLE_NAMES[4]:r'^[A-Z][.、]\s*',STYLE_NAMES[5]:r'^[a-z][.、]\s*',STYLE_NAMES[6]:r'^(?:i|ii|iii|iv|v)[.)、]\s*'}
                 if style in patterns and p.style.name==style:
                     display_text=re.sub(patterns[style],'',display_text,count=1)
-                p.add_run(display_text)
+                if merge: p.add_run(' ' if previous_text[-1:].isascii() and b['text'][:1].isascii() else '')
+                p.add_run(re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]", "", display_text))
                 # Do not invent or rewrite text. Preserve PDF block text verbatim.
                 previous_style=style
                 previous_bbox=b['bbox']
-                trace.append({'page':page_data['page'],'index':bi,'kind':'text','bbox':b['bbox'],'style':p.style.name,'source_text':b['text']})
+                previous_paragraph=p
+                previous_text=b['text']
+                trace.append({'page':page_data['page'],'index':bi,'kind':'text','bbox':b['bbox'],'style':p.style.name,'merged_continuation':merge,'source_text':b['text']})
             else:
+                previous_paragraph=None;previous_bbox=None;previous_style=None;previous_text=None
                 rect=fitz.Rect(b['bbox'])
                 if rect.width<5 or rect.height<5:continue
                 try:

@@ -2,3 +2,5 @@ streamlit
 PyMuPDF
 python-docx
 lxml
+scikit-learn
+python-pptx
